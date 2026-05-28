@@ -23,8 +23,8 @@ import {
 } from "lucide-react";
 import { supabase } from "./lib/supabase";
 
-type UserRole = "Admin" | "RTO" | "MRTO" | "EFS" | "Supervisor" | "Team Lead" | "User";
-type Page = "home" | "operations" | "intelligence" | "approvals" | "profile" | "create_task" | "action_task" | "upload_center" | "diesel_planning" | "recent_activity" | "map_view" | "summary" | "site_detail" | "task_detail" | "cluster_detail";
+type UserRole = "Admin" | "RTO" | "MRTO" | "EFS" | "Supervisor" | "Team Lead" | "Logistics Coordinator" | "User";
+type Page = "home" | "operations" | "intelligence" | "approvals" | "profile" | "create_task" | "action_task" | "upload_center" | "diesel_planning" | "logistics" | "recent_activity" | "map_view" | "summary" | "site_detail" | "task_detail" | "cluster_detail";
 type SummaryKind = "sites" | "near_runout" | "risks" | "approvals" | "cpd" | "supply";
 type TaskType = "Spot Check Request" | "Supply Request" | "Diesel Movement" | "Diesel Review" | "Intervention";
 
@@ -122,9 +122,7 @@ type DieselTx = {
   qty_supplied?: number;
   initial_dip?: number;
   transaction_date?: string;
-  transaction_type?: string;
   created_by_email?: string;
-  created_by_phone?: string;
   status?: string;
   approval_status?: string;
   created_at?: string;
@@ -153,6 +151,32 @@ type DeliveryPlan = {
   truck_capacity_litres?: number;
   route_group?: string;
   recommendation?: string;
+  created_at?: string;
+};
+
+type DieselTruck = {
+  id: string;
+  truck_number: string;
+  capacity_litres?: number;
+  current_volume_litres?: number;
+  driver_name?: string;
+  driver_phone?: string;
+  transporter?: string;
+  status?: "Available" | "Loading" | "Enroute" | "Delivering" | "Completed" | "Maintenance" | string;
+  cycle_start_date?: string;
+  current_cluster?: string;
+  created_at?: string;
+};
+
+type TruckDispatch = {
+  id: string;
+  truck_id?: string;
+  site_id: string;
+  planned_qty_litres?: number;
+  delivered_qty_litres?: number;
+  dispatch_status?: "Planned" | "Approved" | "Enroute" | "Delivered" | "Failed" | string;
+  dispatch_date?: string;
+  route_group?: string;
   created_at?: string;
 };
 
@@ -887,6 +911,8 @@ export default function App() {
   const [activeTask, setActiveTask] = useState<SiteAction | null>(null);
   const [uiState, setUiState] = useState<UiState>({ loading: false, message: "", success: false });
   const [deliveryPlans, setDeliveryPlans] = useState<DeliveryPlan[]>([]);
+  const [dieselTrucks, setDieselTrucks] = useState<DieselTruck[]>([]);
+  const [truckDispatches, setTruckDispatches] = useState<TruckDispatch[]>([]);
   const [cycleStart, setCycleStart] = useState(new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10));
   const [cycleEnd, setCycleEnd] = useState(new Date().toISOString().slice(0, 10));
 
@@ -956,6 +982,7 @@ export default function App() {
         await loadAssignedTasks();
         await loadOperationalData();
         await loadDeliveryPlans();
+        await loadLogisticsData();
         await loadRecentActivities();
       }, "Data synced");
     }
@@ -1116,6 +1143,42 @@ export default function App() {
     setDeliveryPlans((data || []) as DeliveryPlan[]);
   }
 
+  async function loadLogisticsData() {
+    const [truckResult, dispatchResult] = await Promise.all([
+      supabase.from("diesel_trucks").select("*").order("created_at", { ascending: false }),
+      supabase.from("truck_dispatches").select("*").order("created_at", { ascending: false }),
+    ]);
+    if (!truckResult.error) setDieselTrucks((truckResult.data || []) as DieselTruck[]);
+    if (!dispatchResult.error) setTruckDispatches((dispatchResult.data || []) as TruckDispatch[]);
+  }
+
+  async function createTruckDispatch(truck: DieselTruck, plan: DeliveryPlan) {
+    if (!currentUser) throw new Error("No active user.");
+    const qty = Number(plan.planned_qty_litres || 0);
+    const available = Number(truck.current_volume_litres || 0);
+    if (!truck.id) throw new Error("Select a valid truck.");
+    if (qty <= 0) throw new Error("Plan has no valid quantity.");
+    if (available < qty) throw new Error("Truck does not have enough available diesel for this dispatch.");
+
+    const { error } = await supabase.from("truck_dispatches").insert({
+      truck_id: truck.id,
+      site_id: plan.site_id,
+      planned_qty_litres: qty,
+      dispatch_status: "Planned",
+      dispatch_date: new Date().toISOString().slice(0, 10),
+      route_group: plan.route_group || plan.route_name || null,
+    });
+    if (error) throw error;
+
+    await supabase.from("diesel_trucks").update({
+      current_volume_litres: Math.max(available - qty, 0),
+      status: "Enroute",
+    }).eq("id", truck.id);
+
+    await logActivity("Truck Dispatch", `${truck.truck_number} dispatched to ${plan.site_id} for ${qty}L.`, "truck_dispatches", plan.site_id);
+    await loadLogisticsData();
+  }
+
   async function loadRecentActivities() {
     const { data, error } = await supabase.from("recent_activities").select("*").order("created_at", { ascending: false }).limit(100);
     if (!error) setActivities((data || []) as RecentActivity[]);
@@ -1174,13 +1237,21 @@ export default function App() {
   function smartAssignableUsers(siteId: string) {
     const site = sites.find((item) => item.site_id === siteId);
     if (!site) return [];
-    return users.filter((user) => userCanSeeSite(user, site) || ["Admin", "RTO"].includes(user.role));
+    const contactUsers: AppUser[] = [
+      site.team_lead_phone_normalized ? { id: `tl-${site.site_id}`, name: site.team_lead_full_name || "Team Lead", phone: site.team_lead_phone_normalized, email: site.team_lead_phone_normalized, role: "Team Lead", is_active: true } : null,
+      site.supervisor_phone_normalized ? { id: `sup-${site.site_id}`, name: site.supervisor_full_name || "Supervisor", phone: site.supervisor_phone_normalized, email: site.supervisor_phone_normalized, role: "Supervisor", is_active: true } : null,
+      site.efs_phone_normalized ? { id: `efs-${site.site_id}`, name: site.efs_full_name || "EFS", phone: site.efs_phone_normalized, email: site.efs_phone_normalized, role: "EFS", is_active: true } : null,
+      site.mrto_phone_normalized ? { id: `mrto-${site.site_id}`, name: site.mrto_full_name || "MRTO", phone: site.mrto_phone_normalized, email: site.mrto_phone_normalized, role: "MRTO", is_active: true } : null,
+    ].filter(Boolean) as AppUser[];
+    const databaseUsers = users.filter((user) => userCanSeeSite(user, site) || ["Admin", "RTO", "Logistics Coordinator"].includes(user.role));
+    const merged = [...databaseUsers, ...contactUsers];
+    return merged.filter((user, index, arr) => index === arr.findIndex((item) => (item.email || item.phone) === (user.email || user.phone)));
   }
 
   async function createAssignedTask() {
     if (!currentUser) throw new Error("No active user.");
     const site = visibleSites.find((item) => item.site_id === createTaskSite);
-    const assignee = users.find((user) => user.email === createTaskAssignee);
+    const assignee = smartAssignableUsers(createTaskSite).find((user) => (user.email || user.phone) === createTaskAssignee);
     if (!site) throw new Error("Select a valid site in your bucket.");
     if (!assignee) throw new Error("Select assignee.");
 
@@ -1191,7 +1262,7 @@ export default function App() {
       dg_capacity: site.dg_capacity || null,
       cluster_name: site.msp_cluster || null,
       created_by: currentUser.email,
-      assigned_to: assignee.email,
+      assigned_to: assignee.email || assignee.phone,
       assigned_to_role: assignee.role,
       current_approval_level: assignee.role,
       status: `${createTaskType} pending action`,
@@ -1199,7 +1270,7 @@ export default function App() {
       recommendation: "Task created and assigned for action.",
     });
     if (error) throw error;
-    await logActivity("Create Task", `${createTaskType} assigned to ${assignee.email} for ${site.site_id}.`, "site_actions", site.site_id);
+    await logActivity("Create Task", `${createTaskType} assigned to ${assignee.name || assignee.email || assignee.phone} for ${site.site_id}.`, "site_actions", site.site_id);
     setCreateTaskSite("");
     setCreateTaskAssignee("");
     await loadAssignedTasks();
@@ -1437,15 +1508,15 @@ export default function App() {
       <div className="min-h-screen overflow-x-hidden bg-[#06111f] p-4 text-white">
         <div className="mx-auto flex min-h-screen max-w-md items-center">
           <div className="w-full rounded-[32px] border border-slate-700/70 bg-[#081827]/90 p-7 shadow-2xl shadow-black/60">
-            <div className="mb-8 flex items-center gap-3">
-              <ShieldCheck className="h-8 w-8 text-cyan-400" />
+            <div className="mb-6 flex items-center gap-3">
+              <img src="/neoera-icon.png" className="h-11 w-11 rounded-xl object-contain" alt="NeoEra" />
               <div>
                 <p className="text-sm font-bold text-emerald-400">NeoEra</p>
-                <h1 className="text-xl font-black tracking-wide">Field Ops</h1>
+                <h1 className="text-base font-black tracking-wide">Operational Decision Intelligence</h1>
               </div>
             </div>
-            <p className="text-3xl font-black">{greeting()}, Operator</p>
-            <p className="mt-2 text-sm text-slate-400">Enter your assigned phone number to access NeoEra.</p>
+            <RotatingSafetyFact compact />
+            <p className="mt-5 text-sm text-slate-300">Enter your assigned phone number to access NeoEra.</p>
             <div className="mt-8 space-y-4">
               {!adminMode ? (
                 <>
@@ -1481,6 +1552,7 @@ export default function App() {
           {page === "home" && <HomeScreen user={currentUser} sites={visibleSites} nearRunout={nearRunout} pendingApprovals={pendingApprovals} dieselInHand={dieselInHand} totalConsumption={totalConsumption} totalSupply={totalSupply} recentActivities={activities} goTo={navigate} openSummary={openSummary} tasks={visibleTasks} suppliedThisMonth={new Set(visibleDieselTransactions.filter((tx) => new Date(tx.transaction_date || tx.created_at || 0) >= getCycleStartDate()).map((tx) => tx.site_id)).size} neoRating={myNeoEraRating} notifications={operationalNotifications} openNotificationAction={openNotificationAction} />}
           {page === "operations" && <OperationsScreen groupedTasks={groupedTasks} currentUser={currentUser} startTask={startTask} openTaskDetail={openTaskDetail} setPage={navigate} />}
           {page === "diesel_planning" && <DieselPlanningScreen sites={visibleSites} insights={siteDieselInsights} deliveryPlans={deliveryPlans} runAction={runAction} createDeliveryPlan={createDeliveryPlan} openSiteDetail={openSiteDetail} goBack={() => navigate("operations")} />}
+          {page === "logistics" && <LogisticsCoordinatorScreen currentUser={currentUser} trucks={dieselTrucks} dispatches={truckDispatches} plans={deliveryPlans} sites={visibleSites} runAction={runAction} createTruckDispatch={createTruckDispatch} refresh={loadLogisticsData} goBack={() => navigate("operations")} />}
           {page === "intelligence" && <IntelligenceScreen insights={siteDieselInsights} riskRows={riskRows} capexRatings={capexRatings} cycleStart={cycleStart} cycleEnd={cycleEnd} setCycleStart={setCycleStart} setCycleEnd={setCycleEnd} exportDashboardData={exportDashboardData} openSiteDetail={openSiteDetail} openClusterDetail={openClusterDetail} currentUser={currentUser} sites={visibleSites} />}
           {page === "approvals" && <ApprovalsScreen approvals={pendingApprovals} currentUser={currentUser} insights={siteDieselInsights} dieselTransactions={visibleDieselTransactions} openTaskDetail={openTaskDetail} approveTask={(task, comment) => runAction(() => approveTask(task, comment), "Task approved")} disputeTask={(task, comment) => runAction(() => disputeTask(task, comment), "Task disputed")} />}
           {page === "summary" && <SummaryScreen kind={summaryKind} sites={visibleSites} insights={siteDieselInsights} tasks={visibleTasks} approvals={pendingApprovals} dieselTransactions={visibleDieselTransactions} deliveryPlans={deliveryPlans} runAction={runAction} createDeliveryPlan={createDeliveryPlan} goTo={navigate} openSiteDetail={openSiteDetail} openTaskDetail={openTaskDetail} openClusterDetail={openClusterDetail} currentUser={currentUser} />}
@@ -1504,6 +1576,7 @@ export default function App() {
   "action_task",
   "upload_center",
   "diesel_planning",
+  "logistics",
   "recent_activity",
   "map_view",
   "summary",
@@ -1524,7 +1597,7 @@ function AppHeader({ user, openTasks }: { user: AppUser; openTasks: number }) {
     <header className="px-4 pb-4 pt-6">
       <div className="mb-6 flex items-center justify-between">
         <Menu className="h-6 w-6 text-slate-300" />
-        <div className="flex items-center gap-2 text-sm font-bold"><span className="text-emerald-400">NeoEra</span><span>Field Ops</span></div>
+        <div className="flex items-center gap-2 text-sm font-bold"><img src="/neoera-icon.png" className="h-7 w-7 object-contain" alt="NeoEra" /><span className="text-emerald-400">NeoEra</span><span className="hidden sm:inline">Operational Decision Intelligence</span></div>
         <div className="relative"><Bell className="h-6 w-6 text-slate-200" />{openTasks > 0 && <span className="absolute -right-2 -top-2 rounded-full bg-blue-500 px-1.5 text-[10px] font-bold">{openTasks}</span>}</div>
       </div>
       <div className="flex items-start justify-between">
@@ -2051,6 +2124,15 @@ function OperationsScreen({ groupedTasks, currentUser, startTask, openTaskDetail
               <p className="text-xs text-slate-400">Plan truck supply for near-runout truckable sites within 72hrs.</p>
             </div>
             <button className="rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("diesel_planning")}>Open</button>
+          </div>
+        </GlassCard>
+        <GlassCard>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="font-bold">Logistics Coordinator</h3>
+              <p className="text-xs text-slate-400">Track trucks, available volume, dispatch status and cycle logistics.</p>
+            </div>
+            <button className="rounded-2xl bg-cyan-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("logistics")}>Open</button>
           </div>
         </GlassCard>
       </div>
@@ -2762,417 +2844,6 @@ function getEstimatedDieselLevel(insight: SiteDieselInsight | undefined, lastSup
 }
 
 
-
-function Screen({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="space-y-4 animate-in fade-in duration-500 lg:col-span-12">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-blue-300">NeoEra Console</p>
-          <h2 className="mt-1 text-2xl font-black text-white">{title}</h2>
-        </div>
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function TaskCard({ task, currentUser, startTask, openTaskDetail }: any) {
-  const canAct = task.assigned_to_role === currentUser?.role || task.current_approval_level === currentUser?.role || ["Admin", "RTO"].includes(currentUser?.role);
-  return (
-    <GlassCard>
-      <div className="flex items-start justify-between gap-3">
-        <button className="min-w-0 text-left" onClick={() => openTaskDetail?.(task.id)}>
-          <p className="font-bold text-white">{task.site_id}</p>
-          <p className="text-xs text-slate-400">{task.action_type} • {task.execution_status || task.status || "Pending"}</p>
-          <p className="mt-1 text-[11px] text-slate-500">{task.recommendation || task.status || "No recommendation yet."}</p>
-        </button>
-        <span className="rounded-xl border border-blue-400/30 bg-blue-500/10 px-2 py-1 text-[10px] font-bold text-blue-300">{task.current_approval_level || task.assigned_to_role || "-"}</span>
-      </div>
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs font-bold text-slate-300" onClick={() => openTaskDetail?.(task.id)}>View Details</button>
-        <button className="rounded-xl bg-blue-500 px-3 py-2 text-xs font-bold text-white disabled:opacity-40" disabled={!canAct} onClick={() => startTask?.(task)}>Take Action</button>
-      </div>
-    </GlassCard>
-  );
-}
-
-function InsightRow({ row, openSiteDetail }: { row: SiteDieselInsight; openSiteDetail?: (siteId: string) => void }) {
-  const varianceTone = getVarianceTone(row.field_vs_system_variance);
-  const rating = getSiteConsumptionRating(Number(row.cpd_last_10_days || row.recommended_cpd || 0));
-  return (
-    <button className="mb-2 w-full rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3 text-left transition hover:bg-slate-900/70" onClick={() => openSiteDetail?.(row.site_id)}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2"><p className="font-bold text-white">{row.site_id}</p><SiteRatingBadge rating={rating} /></div>
-          <p className="text-xs text-slate-400">{row.cluster} • CPD {row.cpd_last_10_days}L/day • Runout {row.runout_days}d</p>
-          <p className={`mt-1 text-[11px] ${varianceTone}`}>{getVarianceLabel(row.field_vs_system_variance)} • Variance {row.field_vs_system_variance}</p>
-        </div>
-        <ChevronRight className="h-5 w-5 text-slate-500" />
-      </div>
-    </button>
-  );
-}
-
-function SummaryTaskItem({ task, openSiteDetail }: { task: SiteAction; openSiteDetail: (siteId: string) => void }) {
-  return (
-    <button className="w-full rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3 text-left" onClick={() => openSiteDetail(task.site_id)}>
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <p className="font-bold text-white">{task.site_id}</p>
-          <p className="text-xs text-slate-400">{task.action_type} • {task.execution_status || task.status || "Pending"}</p>
-        </div>
-        <span className="rounded-xl border border-slate-600 px-2 py-1 text-[10px] text-slate-300">{task.current_approval_level || "-"}</span>
-      </div>
-    </button>
-  );
-}
-
-function ProfileScreen({ user, users, sites, canCreateTasks, canAssignUsers, setPage, logout }: any) {
-  return (
-    <Screen title="Profile">
-      <GlassCard>
-        <div className="flex items-start gap-3">
-          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-500/10 text-blue-400"><User className="h-7 w-7" /></div>
-          <div className="min-w-0 flex-1">
-            <p className="text-xl font-black">{user.name || user.phone || user.email}</p>
-            <p className="text-sm text-slate-400">{user.role} • {user.phone || user.email}</p>
-            <p className="mt-1 text-xs text-slate-500">{sites.length} visible site(s)</p>
-          </div>
-        </div>
-      </GlassCard>
-      <div className="grid gap-3 md:grid-cols-2">
-        {canCreateTasks && <QuickAction icon={<Plus className="h-5 w-5" />} label="Create Task" onClick={() => setPage("create_task")} />}
-        <QuickAction icon={<Activity className="h-5 w-5" />} label="Recent Activity" onClick={() => setPage("recent_activity")} />
-        <QuickAction icon={<MapPin className="h-5 w-5" />} label="Map View" onClick={() => setPage("map_view")} />
-        <QuickAction icon={<Database className="h-5 w-5" />} label="Upload Center" onClick={() => setPage("upload_center")} />
-      </div>
-      <GlassCard>
-        <p className="text-sm text-slate-400">Users loaded: {users.length}. Assignment control is backend-driven by phone-number ownership.</p>
-        {canAssignUsers && <p className="mt-2 text-xs text-blue-300">Admin/management controls active.</p>}
-        <button className="mt-4 w-full rounded-2xl border border-red-400/40 px-4 py-3 text-sm font-bold text-red-300" onClick={logout}>Log out</button>
-      </GlassCard>
-    </Screen>
-  );
-}
-
-function RecentActivityScreen({ activities, goBack, openTaskDetail, openSiteDetail }: any) {
-  const [query, setQuery] = useState("");
-  const filtered = activities.filter((activity: RecentActivity) => `${activity.description} ${activity.actor_name} ${activity.entity_id}`.toLowerCase().includes(query.toLowerCase()));
-  return (
-    <Screen title="Recent Activity">
-      <GlassCard>
-        <div className="mb-3 flex items-center justify-between">
-          <p className="font-bold">Activity Stream</p>
-          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
-        </div>
-        <SmartSearchBox query={query} setQuery={setQuery} placeholder="Search activity, user, site..." suggestions={filtered.slice(0, 10).map((x: RecentActivity) => x.entity_id || x.action_type)} />
-      </GlassCard>
-      <div className="space-y-3">
-        {filtered.map((activity: RecentActivity) => (
-          <button key={activity.id} className="w-full text-left" onClick={() => activity.entity_type === "site_actions" ? openTaskDetail?.(activity.entity_id) : activity.entity_id ? openSiteDetail?.(activity.entity_id) : null}>
-            <ActivityRow activity={activity} />
-          </button>
-        ))}
-        {!filtered.length && <EmptyState title="No activity found" text="No matching activity record." />}
-      </div>
-    </Screen>
-  );
-}
-
-function MapViewScreen({ sites, insights, openSiteDetail, goBack }: any) {
-  const [query, setQuery] = useState("");
-  const filtered = sites.filter((site: Site) => getSearchableText(site).includes(query.toLowerCase()));
-  return (
-    <Screen title="Map View">
-      <GlassCard>
-        <div className="mb-3 flex items-center justify-between">
-          <p className="font-bold">Site Map Intelligence</p>
-          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
-        </div>
-        <SmartSearchBox query={query} setQuery={setQuery} suggestions={filtered.slice(0, 10).map((site: Site) => site.site_id)} />
-        <div className="mt-4"><LiveMapCard /></div>
-      </GlassCard>
-      <div className="space-y-2">
-        {filtered.slice(0, query ? 100 : 30).map((site: Site) => {
-          const insight = insights.find((row: SiteDieselInsight) => row.site_id === site.site_id);
-          return <SummarySiteItem key={site.site_id} site={site} insight={insight} openSiteDetail={openSiteDetail} />;
-        })}
-      </div>
-    </Screen>
-  );
-}
-
-function SiteDetailScreen({ site, insight, tasks, dieselTransactions, spotChecks, openTaskDetail, goBack }: any) {
-  if (!site) return <Screen title="Site Detail"><EmptyState title="Site not found" text="The selected site is not in your visible bucket." /></Screen>;
-  const lastSupply = getLastSupplyForSite(site.site_id, dieselTransactions || []);
-  const siteRating = getSiteConsumptionRating(Number(insight?.cpd_last_10_days || insight?.recommended_cpd || 0));
-  return (
-    <Screen title={site.site_id}>
-      <GlassCard>
-        <button className="mb-3 rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2"><h3 className="text-xl font-black">{site.site_id}</h3><SiteRatingBadge rating={siteRating} /></div>
-            <p className="mt-1 text-sm text-slate-400">{site.msp_cluster || "-"} • {site.state || "-"}</p>
-            <p className="mt-1 text-xs text-slate-500">{site.deprecated_address_name || "No alias captured"}</p>
-          </div>
-          <span className={`rounded-xl border px-2 py-1 text-xs ${site.is_truckable ? "border-emerald-400/40 text-emerald-400" : "border-orange-400/40 text-orange-400"}`}>{site.is_truckable ? "Truckable" : "Non-truckable"}</span>
-        </div>
-      </GlassCard>
-      <div className="grid grid-cols-2 gap-3">
-        <TacticalMetric label="Current Diesel" value={`${insight?.current_diesel_level ?? "-"}L`} detail="last field reading" tone="cyan" />
-        <TacticalMetric label="Estimated Diesel" value={`${insight?.estimated_current_diesel ?? "-"}L`} detail="system calculated" tone="blue" />
-        <TacticalMetric label="Runout Days" value={insight?.runout_days ?? "-"} detail={insight?.runout_date || "no runout date"} tone="amber" />
-        <TacticalMetric label="CPD" value={`${insight?.cpd_last_10_days ?? "-"}L`} detail="10-day average" tone="green" />
-      </div>
-      <GlassCard>
-        <h3 className="mb-3 font-bold">Supply Timeline</h3>
-        <div className="space-y-2">
-          {(dieselTransactions || []).slice(0, 20).map((tx: DieselTx) => <PreviewMetric key={tx.id} label={tx.transaction_date ? new Date(tx.transaction_date).toLocaleDateString() : "Supply"} value={`${tx.qty_supplied || 0}L supplied • Initial dip ${tx.initial_dip || 0}L`} />)}
-          {!dieselTransactions?.length && <p className="text-sm text-slate-400">No supply record for this site.</p>}
-        </div>
-      </GlassCard>
-      <GlassCard>
-        <h3 className="mb-3 font-bold">Tasks & Spot Checks</h3>
-        <div className="space-y-2">
-          {(tasks || []).slice(0, 10).map((task: SiteAction) => <button key={task.id} className="w-full rounded-xl border border-slate-700 p-3 text-left text-sm" onClick={() => openTaskDetail(task.id)}>{task.action_type} • {task.execution_status || task.status}</button>)}
-          {(spotChecks || []).slice(0, 5).map((spot: SpotCheck) => <PreviewMetric key={spot.id} label={spot.check_date ? new Date(spot.check_date).toLocaleString() : "Spot check"} value={`${spot.diesel_level || 0}L • CPD ${spot.revised_consumption_per_day || spot.consumption_per_day || 0}L/day`} />)}
-        </div>
-      </GlassCard>
-    </Screen>
-  );
-}
-
-function TaskDetailScreen({ task, site, insight, dieselTransactions, spotChecks, startTask, approveTask, disputeTask, goBack }: any) {
-  const [comment, setComment] = useState("");
-  if (!task) return <Screen title="Task Detail"><EmptyState title="Task not found" text="The selected task is not in your visible queue." /></Screen>;
-  return (
-    <Screen title="Task Detail">
-      <GlassCard>
-        <button className="mb-3 rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
-        <p className="text-xl font-black">{task.site_id}</p>
-        <p className="text-sm text-slate-400">{task.action_type} • {task.execution_status || task.status}</p>
-        <p className="mt-2 text-xs text-slate-500">{task.recommendation || "No recommendation captured."}</p>
-      </GlassCard>
-      <SiteDetailScreen site={site} insight={insight} tasks={[task]} dieselTransactions={dieselTransactions} spotChecks={spotChecks} openTaskDetail={() => null} goBack={goBack} />
-      <GlassCard>
-        <input className="w-full rounded-xl border border-slate-700 bg-slate-950/50 px-3 py-2 text-sm text-white" placeholder="Approval or dispute comment" value={comment} onChange={(e) => setComment(e.target.value)} />
-        <div className="mt-3 grid grid-cols-3 gap-2">
-          <button className="rounded-xl bg-blue-500 px-3 py-2 text-xs font-bold" onClick={() => startTask(task)}>Take Action</button>
-          <button className="rounded-xl bg-emerald-500 px-3 py-2 text-xs font-bold" onClick={() => approveTask(task, comment)}>Approve</button>
-          <button className="rounded-xl border border-red-400/40 px-3 py-2 text-xs font-bold text-red-400" onClick={() => disputeTask(task, comment)}>Dispute</button>
-        </div>
-      </GlassCard>
-    </Screen>
-  );
-}
-
-function ClusterDetailScreen({ cluster, sites, insights, dieselTransactions, openSiteDetail, goBack }: any) {
-  const [query, setQuery] = useState("");
-  const filtered = sites.filter((site: Site) => getSearchableText(site).includes(query.toLowerCase()));
-  const runout = insights.filter((row: SiteDieselInsight) => Number(row.runout_days) <= 3).length;
-  return (
-    <Screen title={cluster || "Cluster Detail"}>
-      <GlassCard>
-        <div className="mb-3 flex items-center justify-between">
-          <p className="font-bold">{cluster}</p>
-          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
-        </div>
-        <div className="mb-3 grid grid-cols-3 gap-2">
-          <SummaryMini label="Sites" value={sites.length} />
-          <SummaryMini label="Runout" value={runout} />
-          <SummaryMini label="Supply Tx" value={dieselTransactions.length} />
-        </div>
-        <SmartSearchBox query={query} setQuery={setQuery} suggestions={filtered.slice(0, 10).map((site: Site) => site.site_id)} />
-      </GlassCard>
-      <div className="space-y-2">
-        {filtered.map((site: Site) => <SummarySiteItem key={site.site_id} site={site} insight={insights.find((row: SiteDieselInsight) => row.site_id === site.site_id)} openSiteDetail={openSiteDetail} />)}
-      </div>
-    </Screen>
-  );
-}
-
-function parseSimpleCsv(text: string) {
-  const lines = text.trim().replace(/\r/g, "").split("\n").filter(Boolean);
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(",").map((h) => h.trim());
-  return lines.slice(1).map((line) => {
-    const values = line.split(",");
-    return headers.reduce((acc: any, header, index) => {
-      acc[header] = (values[index] || "").trim();
-      return acc;
-    }, {});
-  });
-}
-
-function downloadTemplateCsv(filename: string, headers: string[]) {
-  const blob = new Blob([headers.join(",") + "\n"], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function UploadCenterScreen({ currentUser, runAction, refresh, goBack }: any) {
-  const [uploadType, setUploadType] = useState<"spot_check" | "supply">("spot_check");
-  const [previewRows, setPreviewRows] = useState<any[]>([]);
-  const spotHeaders = ["site_id","total_qty_supplied","date_of_first_supply","diesel_level_before_supply","cpd","date_of_last_visit","diesel_level_on_last_visit","dg_capacity"];
-  const supplyHeaders = ["site_id","transaction_date","qty_supplied","initial_dip","supply_ref"];
-
-  function handleFile(file?: File) {
-    if (!file) return;
-    file.text().then((value) => setPreviewRows(parseSimpleCsv(value)));
-  }
-
-  async function submitUpload() {
-    const actorName = currentUser?.name || currentUser?.phone || currentUser?.email || "User";
-    const actorPhone = currentUser?.phone || null;
-    const actorEmail = currentUser?.email || null;
-    const status = ["Admin", "RTO"].includes(currentUser?.role) ? "Approved" : "Pending MRTO Approval";
-
-    if (!previewRows.length) throw new Error("Upload a CSV first.");
-
-    if (uploadType === "spot_check") {
-      const rows = previewRows.map((row) => {
-        const diesel = Number(row.diesel_level_on_last_visit || 0);
-        const cpd = Number(row.cpd || 0);
-        const baseDate = row.date_of_last_visit ? new Date(row.date_of_last_visit) : new Date();
-        const runOutDate = diesel > 0 && cpd > 0 && !Number.isNaN(baseDate.getTime()) ? new Date(baseDate.getTime() + Math.ceil(diesel / cpd) * 86400000).toISOString() : null;
-        const dgCapacity = Number(row.dg_capacity || 0);
-        return {
-          site_id: row.site_id,
-          check_date: row.date_of_last_visit || new Date().toISOString(),
-          diesel_level: diesel,
-          dg_capacity: dgCapacity,
-          dg_type: dgCapacity === 12 || dgCapacity === 17 ? "DCDG" : "ACDG",
-          consumption_per_day: cpd,
-          revised_consumption_per_day: cpd,
-          run_out_date: runOutDate,
-          total_qty_supplied: Number(row.total_qty_supplied || 0),
-          diesel_level_before_supply: Number(row.diesel_level_before_supply || 0),
-          date_of_first_supply: row.date_of_first_supply || null,
-          approval_status: status,
-          upload_source: "Upload Center",
-          created_by_phone: actorPhone,
-          created_by_email: actorEmail,
-          check_shift: "Bulk Upload",
-        };
-      });
-      const { error } = await supabase.from("spot_checks").insert(rows);
-      if (error) throw error;
-    } else {
-      const rows = previewRows.map((row) => ({
-        site_id: row.site_id,
-        transaction_date: row.transaction_date || new Date().toISOString(),
-        qty_supplied: Number(row.qty_supplied || 0),
-        initial_dip: Number(row.initial_dip || 0),
-        supply_ref: row.supply_ref || null,
-        transaction_type: "Supply",
-        approval_status: status,
-        status,
-        created_by_phone: actorPhone,
-        created_by_email: actorEmail,
-      }));
-      const { error } = await supabase.from("diesel_transactions").insert(rows);
-      if (error) throw error;
-    }
-
-    await supabase.from("recent_activities").insert({
-      actor_email: actorEmail,
-      actor_phone: actorPhone,
-      actor_name: actorName,
-      action_type: "Bulk Upload",
-      description: `${actorName} updated ${uploadType === "spot_check" ? "spot-check" : "supply"} records via Upload Center — ${previewRows.length} row(s). Status: ${status}.`,
-      entity_type: uploadType,
-      entity_id: "bulk_upload",
-    });
-
-    setPreviewRows([]);
-    await refresh();
-  }
-
-  return (
-    <Screen title="Upload Center">
-      <GlassCard>
-        <div className="mb-3 flex items-center justify-between">
-          <div>
-            <p className="font-bold">Bulk Operational Upload</p>
-            <p className="text-xs text-slate-400">Admin uploads auto-approve. EFS/MRTO uploads enter approval logic.</p>
-          </div>
-          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
-        </div>
-        <Segment tabs={["spot_check", "supply"]} active={uploadType} setActive={setUploadType} />
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-slate-300" onClick={() => downloadTemplateCsv(uploadType === "spot_check" ? "neoera_spot_check_template.csv" : "neoera_supply_template.csv", uploadType === "spot_check" ? spotHeaders : supplyHeaders)}>Download Template</button>
-          <label className="rounded-xl bg-blue-500 px-3 py-2 text-center text-xs font-bold text-white">
-            Upload CSV
-            <input type="file" accept=".csv,text/csv" className="hidden" onChange={(event) => handleFile(event.target.files?.[0])} />
-          </label>
-        </div>
-      </GlassCard>
-      <GlassCard>
-        <div className="mb-3 flex items-center justify-between">
-          <p className="font-bold">Preview</p>
-          <span className="text-xs text-slate-400">{previewRows.length} row(s)</span>
-        </div>
-        <div className="max-h-80 overflow-auto rounded-2xl border border-slate-700 bg-slate-950/30">
-          <pre className="p-3 text-[10px] text-slate-300">{JSON.stringify(previewRows.slice(0, 10), null, 2)}</pre>
-        </div>
-        <button className="mt-3 w-full rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-bold text-white" onClick={() => runAction(submitUpload, "Upload posted")}>Post Upload</button>
-      </GlassCard>
-    </Screen>
-  );
-}
-
-function CreateTaskScreen({ sites, users, taskType, setTaskType, selectedSite, setSelectedSite, selectedAssignee, setSelectedAssignee, createTask }: any) {
-  const [query, setQuery] = useState("");
-  const filteredSites = sites.filter((site: Site) => getSearchableText(site).includes(query.toLowerCase()));
-  return (
-    <Screen title="Create Task">
-      <GlassCard>
-        <Field label="Task Type"><Select value={taskType} onChange={setTaskType} options={TASK_TYPES} /></Field>
-        <Field label="Search Site"><SmartSearchBox query={query} setQuery={setQuery} suggestions={filteredSites.slice(0, 8).map((site: Site) => site.site_id)} /></Field>
-        <Field label="Site"><Select value={selectedSite} onChange={setSelectedSite} options={["", ...filteredSites.slice(0, query ? 200 : 60).map((site: Site) => site.site_id)]} /></Field>
-        <Field label="Assignee"><Select value={selectedAssignee} onChange={setSelectedAssignee} options={["", ...users.map((user: AppUser) => user.email).filter(Boolean)]} /></Field>
-        <button className="w-full rounded-2xl bg-blue-500 px-4 py-3 font-bold text-white" onClick={createTask}>Create Task</button>
-      </GlassCard>
-    </Screen>
-  );
-}
-
-function ActionTaskScreen({ task, selectedSite, setSelectedSite, sites, supplyDate, setSupplyDate, initialDip, setInitialDip, qtySupplied, setQtySupplied, spotCheckDate, setSpotCheckDate, dieselLevel, setDieselLevel, dgCapacity, setDgCapacity, closureNote, setClosureNote, unsafeCondition, setUnsafeCondition, recommendedAction, setRecommendedAction, submitSpotCheck, submitSupply }: any) {
-  const isSupply = task?.action_type === "Supply Request" || task?.action_type === "Diesel Movement";
-  return (
-    <Screen title="Action Task">
-      <GlassCard>
-        <p className="mb-3 text-sm text-slate-400">{task?.action_type} • {task?.site_id}</p>
-        <Field label="Site"><Select value={selectedSite} onChange={setSelectedSite} options={["", ...sites.map((site: Site) => site.site_id)]} /></Field>
-        {isSupply ? (
-          <>
-            <Field label="Supply Date"><DarkInput type="date" value={supplyDate} onChange={setSupplyDate} /></Field>
-            <Field label="Initial Dip"><DarkInput value={initialDip} onChange={setInitialDip} /></Field>
-            <Field label="Qty Supplied"><DarkInput value={qtySupplied} onChange={setQtySupplied} /></Field>
-          </>
-        ) : (
-          <>
-            <Field label="Spot Check Date"><DarkInput type="datetime-local" value={spotCheckDate} onChange={setSpotCheckDate} /></Field>
-            <Field label="DG Capacity"><DarkInput value={dgCapacity} onChange={setDgCapacity} /></Field>
-            <Field label="Diesel Level"><DarkInput value={dieselLevel} onChange={setDieselLevel} /></Field>
-          </>
-        )}
-        <Field label="Closure Note"><DarkInput value={closureNote} onChange={setClosureNote} /></Field>
-        <Field label="Unsafe Condition"><Select value={unsafeCondition} onChange={setUnsafeCondition} options={["No", "Yes"]} /></Field>
-        {unsafeCondition === "Yes" && <Field label="Recommended Action"><DarkInput value={recommendedAction} onChange={setRecommendedAction} /></Field>}
-        <button className="w-full rounded-2xl bg-emerald-500 px-4 py-3 font-bold text-white" onClick={isSupply ? submitSupply : submitSpotCheck}>{isSupply ? "Submit Supply" : "Submit Spot Check"}</button>
-      </GlassCard>
-    </Screen>
-  );
-}
-
-
 function Segment({ tabs, active, setActive }: any) {
   return (
     <div className="flex gap-1 overflow-auto rounded-2xl border border-slate-700 bg-slate-950/40 p-1">
@@ -3212,6 +2883,244 @@ function Select({ value, onChange, options }: any) {
 
 function DarkInput({ value, onChange, type = "text" }: any) {
   return <input className="w-full rounded-2xl border border-slate-700 bg-slate-950/60 px-4 py-3 text-white" type={type} value={value} onChange={(event) => onChange(event.target.value)} />;
+}
+
+
+
+function Screen({ title, children }: { title: string; children: React.ReactNode }) {
+  return <div className="space-y-4 animate-in fade-in duration-500 lg:col-span-12"><div className="flex items-center justify-between"><h2 className="text-2xl font-black tracking-tight">{title}</h2></div>{children}</div>;
+}
+
+function TaskCard({ task, currentUser, startTask, openTaskDetail }: any) {
+  return (
+    <GlassCard>
+      <button className="w-full text-left" onClick={() => openTaskDetail(task.id)}>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="font-bold text-white">{task.site_id}</p>
+            <p className="text-xs text-slate-400">{task.action_type} • {task.current_approval_level || task.assigned_to_role || "Unassigned"}</p>
+            <p className="mt-1 text-[10px] text-slate-500">{task.status || task.recommendation || "Pending action"}</p>
+          </div>
+          <span className="rounded-xl border border-blue-400/30 px-2 py-1 text-[10px] text-blue-300">{task.execution_status || "Pending"}</span>
+        </div>
+      </button>
+      <button className="mt-3 w-full rounded-xl bg-blue-500 px-3 py-2 text-xs font-bold text-white" onClick={() => startTask(task)}>Start / Update</button>
+    </GlassCard>
+  );
+}
+
+function RotatingSafetyFact({ compact = false }: { compact?: boolean }) {
+  const facts = [
+    "Loose battery terminals remain one of the leading causes of preventable DC failures.",
+    "Fuel variance without timestamped dip evidence is operational debt.",
+    "A site is not stable until supply is confirmed by post-supply spot checks.",
+    "Diesel planning must respect allocation, tank headroom, cutoff level and road access.",
+    "Unsafe access is not a delay excuse; it is a controlled escalation trigger.",
+    "Every repeat outage is either a technical failure, process failure, or governance failure.",
+  ];
+  const [index, setIndex] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setIndex((value) => (value + 1) % facts.length), 12000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return (
+    <div className={`rounded-2xl border border-cyan-400/20 bg-slate-950/45 ${compact ? "p-3" : "p-4"}`}>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-[10px] font-black uppercase tracking-[0.18em] text-cyan-300">Safety Fact</p>
+        <p className="text-[10px] text-slate-500">{index + 1}/{facts.length}</p>
+      </div>
+      <p className={`${compact ? "mt-2 text-sm" : "mt-3 text-base"} leading-relaxed text-slate-100`}>“{facts[index]}”</p>
+    </div>
+  );
+}
+
+function LogisticsCoordinatorScreen({ currentUser, trucks, dispatches, plans, sites, runAction, createTruckDispatch, refresh, goBack }: any) {
+  const [selectedTruckId, setSelectedTruckId] = useState("");
+  const [query, setQuery] = useState("");
+  const activePlans = (plans || []).filter((plan: DeliveryPlan) => ["Planned", "Approved", "In Progress"].includes(plan.planning_status || "Planned"));
+  const filteredPlans = activePlans.filter((plan: DeliveryPlan) => `${plan.site_id} ${plan.route_group || ""} ${plan.route_name || ""}`.toLowerCase().includes(query.toLowerCase()));
+  const selectedTruck = (trucks || []).find((truck: DieselTruck) => truck.id === selectedTruckId) || (trucks || [])[0];
+  const totalTruckVolume = (trucks || []).reduce((sum: number, truck: DieselTruck) => sum + Number(truck.current_volume_litres || 0), 0);
+  const plannedLitres = activePlans.reduce((sum: number, plan: DeliveryPlan) => sum + Number(plan.planned_qty_litres || 0), 0);
+  const activeDispatches = (dispatches || []).filter((row: TruckDispatch) => !["Delivered", "Failed"].includes(row.dispatch_status || ""));
+
+  return (
+    <Screen title="Logistics Coordinator">
+      <GlassCard>
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <h3 className="font-black">Diesel Management Layer</h3>
+            <p className="mt-1 text-xs text-slate-400">Manage truck volume, dispatch plans, allocation cycles and route execution.</p>
+            <p className="mt-1 text-[10px] text-emerald-400">Role: {currentUser?.role}</p>
+          </div>
+          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <SummaryMini label="Truck Volume" value={`${Math.round(totalTruckVolume)}L`} />
+          <SummaryMini label="Planned Qty" value={`${Math.round(plannedLitres)}L`} />
+          <SummaryMini label="Active Dispatch" value={activeDispatches.length} />
+        </div>
+      </GlassCard>
+
+      <GlassCard>
+        <h3 className="mb-3 font-bold">Truck Registry</h3>
+        <div className="space-y-2">
+          {(trucks || []).length ? (trucks || []).map((truck: DieselTruck) => (
+            <button key={truck.id} className={`w-full rounded-2xl border p-3 text-left ${selectedTruck?.id === truck.id ? "border-cyan-400/50 bg-cyan-500/10" : "border-slate-700/60 bg-slate-950/30"}`} onClick={() => setSelectedTruckId(truck.id)}>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-black text-white">{truck.truck_number}</p>
+                  <p className="text-xs text-slate-400">{truck.driver_name || "Driver not set"} • {truck.transporter || "Transporter not set"}</p>
+                  <p className="text-[10px] text-slate-500">Cluster: {truck.current_cluster || "-"} • Cycle: {truck.cycle_start_date || "-"}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-sm font-black text-emerald-400">{Number(truck.current_volume_litres || 0).toLocaleString()}L</p>
+                  <p className="text-[10px] text-slate-500">of {Number(truck.capacity_litres || 14000).toLocaleString()}L</p>
+                  <p className="mt-1 text-[10px] uppercase tracking-widest text-cyan-300">{truck.status || "Available"}</p>
+                </div>
+              </div>
+            </button>
+          )) : <EmptyState title="No trucks loaded" text="Upload or create diesel trucks in Supabase table diesel_trucks. Columns: truck_number, capacity_litres, current_volume_litres, driver_name, driver_phone, transporter, status, cycle_start_date, current_cluster." />}
+        </div>
+      </GlassCard>
+
+      <GlassCard>
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h3 className="font-bold">Dispatch Planned Sites</h3>
+            <p className="text-xs text-slate-400">Dispatch a selected truck to planned sites. Truck volume reduces after dispatch.</p>
+          </div>
+          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={() => runAction(refresh, "Logistics refreshed")}>Refresh</button>
+        </div>
+        <SmartSearchBox query={query} setQuery={setQuery} placeholder="Search planned site or route..." suggestions={filteredPlans.slice(0, 8).map((plan: DeliveryPlan) => plan.site_id)} />
+        <div className="mt-3 space-y-3">
+          {filteredPlans.slice(0, query ? 80 : 20).map((plan: DeliveryPlan) => {
+            const site = (sites || []).find((item: Site) => item.site_id === plan.site_id);
+            const alreadyDispatched = (dispatches || []).find((row: TruckDispatch) => row.site_id === plan.site_id && !["Delivered", "Failed"].includes(row.dispatch_status || ""));
+            return (
+              <div key={plan.id || plan.site_id} className="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-bold text-white">{plan.site_id}</p>
+                    <p className="text-xs text-slate-400">{plan.route_group || plan.route_name || site?.msp_cluster || "Unassigned route"}</p>
+                    <p className="text-[10px] text-slate-500">Planned: {plan.planned_qty_litres || 0}L • Dispatch date: {plan.dispatch_date || "T+3"}</p>
+                  </div>
+                  <span className={`rounded-xl border px-2 py-1 text-[10px] ${alreadyDispatched ? "border-emerald-400/40 text-emerald-400" : "border-blue-400/40 text-blue-400"}`}>{alreadyDispatched ? "Dispatched" : "Ready"}</span>
+                </div>
+                {!alreadyDispatched && <button className="mt-3 w-full rounded-xl bg-cyan-500 px-3 py-2 text-xs font-bold text-white" onClick={() => selectedTruck && runAction(() => createTruckDispatch(selectedTruck, plan), "Truck dispatched")}>Dispatch Selected Truck</button>}
+              </div>
+            );
+          })}
+          {!filteredPlans.length && <p className="py-4 text-center text-sm text-slate-400">No active planned site matched.</p>}
+        </div>
+      </GlassCard>
+    </Screen>
+  );
+}
+
+function ProfileScreen({ user, sites, canCreateTasks, setPage, logout }: any) {
+  return (
+    <Screen title="More">
+      <GlassCard>
+        <div className="flex items-center gap-3">
+          <img src="/neoera-icon.png" className="h-14 w-14 rounded-2xl object-contain" alt="NeoEra" />
+          <div>
+            <p className="text-xl font-black">{user.name || "Operator"}</p>
+            <p className="text-sm text-slate-400">{user.role} • {sites.length} visible site(s)</p>
+          </div>
+        </div>
+      </GlassCard>
+      <div className="grid gap-3 md:grid-cols-2">
+        {canCreateTasks && <QuickAction icon={<Plus className="h-5 w-5" />} label="Create Task" onClick={() => setPage("create_task")} />}
+        <QuickAction icon={<Database className="h-5 w-5" />} label="Upload Center" onClick={() => setPage("upload_center")} />
+        <QuickAction icon={<Activity className="h-5 w-5" />} label="Recent Activity" onClick={() => setPage("recent_activity")} />
+        <QuickAction icon={<Database className="h-5 w-5" />} label="Logistics Coordinator" onClick={() => setPage("logistics")} />
+      </div>
+      <button className="w-full rounded-2xl border border-red-400/40 px-4 py-3 text-sm font-bold text-red-300" onClick={logout}>Log out</button>
+    </Screen>
+  );
+}
+
+function UploadCenterScreen({ currentUser, runAction, refresh, goBack }: any) {
+  return (
+    <Screen title="Upload Center">
+      <GlassCard>
+        <h3 className="font-black">Bulk Upload Center</h3>
+        <p className="mt-2 text-sm text-slate-400">Use this center for supply, spot-check, allocation, truck registry and trucking status uploads.</p>
+        <div className="mt-4 grid gap-2">
+          <InfoUploadLane title="Spot Check Upload" text="Updates diesel level, CPD, runout date and field intelligence." />
+          <InfoUploadLane title="Supply Upload" text="Posts supply quantities and supply timeline. Admin uploads bypass MRTO approval." />
+          <InfoUploadLane title="Allocation Upload" text="Logistics Coordinator updates allocation, cycle start date and planned balances." />
+          <InfoUploadLane title="Truck Registry Upload" text="Creates trucks, starting volume, status, driver and transporter records." />
+        </div>
+        <button className="mt-4 rounded-xl bg-blue-500 px-4 py-2 text-xs font-bold" onClick={() => runAction(refresh, "Data refreshed")}>Refresh Data</button>
+        <button className="ml-2 mt-4 rounded-xl border border-slate-700 px-4 py-2 text-xs font-bold text-slate-300" onClick={goBack}>Back</button>
+      </GlassCard>
+    </Screen>
+  );
+}
+
+function InfoUploadLane({ title, text }: { title: string; text: string }) {
+  return <div className="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3"><p className="font-bold text-white">{title}</p><p className="mt-1 text-xs text-slate-400">{text}</p></div>;
+}
+
+function CreateTaskScreen({ sites, users, taskType, setTaskType, selectedSite, setSelectedSite, selectedAssignee, setSelectedAssignee, createTask }: any) {
+  return (
+    <Screen title="Create Task">
+      <GlassCard>
+        <Field label="Task Type"><Select value={taskType} onChange={setTaskType} options={TASK_TYPES} /></Field>
+        <Field label="Site"><Select value={selectedSite} onChange={setSelectedSite} options={["", ...sites.map((site: Site) => site.site_id)]} /></Field>
+        <Field label="Assign To"><Select value={selectedAssignee} onChange={setSelectedAssignee} options={["", ...users.map((user: AppUser) => user.email || user.phone || user.name || "")]}/></Field>
+        <p className="mb-3 text-xs text-slate-400">Team Leads can now be assigned using their site phone mapping even if they do not have email accounts.</p>
+        <button className="w-full rounded-2xl bg-blue-500 px-4 py-3 text-sm font-bold" onClick={createTask}>Create Task</button>
+      </GlassCard>
+    </Screen>
+  );
+}
+
+function ActionTaskScreen(props: any) {
+  const isSpot = props.task?.action_type === "Spot Check Request";
+  return (
+    <Screen title={props.task?.action_type || "Action Task"}>
+      <GlassCard>
+        <Field label="Site"><Select value={props.selectedSite} onChange={props.setSelectedSite} options={["", ...props.sites.map((site: Site) => site.site_id)]} /></Field>
+        {isSpot ? <>
+          <Field label="DG Capacity"><DarkInput value={props.dgCapacity} onChange={props.setDgCapacity} type="number" /></Field>
+          <Field label="Diesel Level"><DarkInput value={props.dieselLevel} onChange={props.setDieselLevel} type="number" /></Field>
+          <Field label="Closure Note"><DarkInput value={props.closureNote} onChange={props.setClosureNote} /></Field>
+          <button className="w-full rounded-2xl bg-blue-500 px-4 py-3 text-sm font-bold" onClick={props.submitSpotCheck}>Submit Spot Check</button>
+        </> : <>
+          <Field label="Supply Date"><DarkInput value={props.supplyDate} onChange={props.setSupplyDate} type="date" /></Field>
+          <Field label="Initial Dip"><DarkInput value={props.initialDip} onChange={props.setInitialDip} type="number" /></Field>
+          <Field label="Qty Supplied"><DarkInput value={props.qtySupplied} onChange={props.setQtySupplied} type="number" /></Field>
+          <Field label="Closure Note"><DarkInput value={props.closureNote} onChange={props.setClosureNote} /></Field>
+          <button className="w-full rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-bold" onClick={props.submitSupply}>Submit Supply</button>
+        </>}
+      </GlassCard>
+    </Screen>
+  );
+}
+
+function RecentActivityScreen({ activities, goBack }: any) {
+  return <Screen title="Recent Activity"><GlassCard><button className="mb-3 text-xs text-blue-400" onClick={goBack}>Back</button><div className="space-y-2">{activities.map((activity: RecentActivity) => <ActivityRow key={activity.id} activity={activity} />)}</div></GlassCard></Screen>;
+}
+
+function MapViewScreen({ sites, openSiteDetail, goBack }: any) {
+  return <Screen title="Map View"><GlassCard><button className="mb-3 text-xs text-blue-400" onClick={goBack}>Back</button><LiveMapCard /><div className="mt-3 max-h-[50vh] space-y-2 overflow-auto">{sites.slice(0, 80).map((site: Site) => <button key={site.site_id} className="w-full rounded-xl border border-slate-700/60 p-2 text-left text-sm" onClick={() => openSiteDetail(site.site_id)}>{site.site_id} • {site.msp_cluster || site.state || "-"}</button>)}</div></GlassCard></Screen>;
+}
+
+function SiteDetailScreen({ site, insight, tasks, dieselTransactions, spotChecks, openTaskDetail, goBack }: any) {
+  if (!site) return <Screen title="Site Detail"><EmptyState title="Site not found" text="Return and select a valid site." /></Screen>;
+  return <Screen title={site.site_id}><GlassCard><button className="mb-3 text-xs text-blue-400" onClick={goBack}>Back</button><SummarySiteItem site={site} insight={insight} openSiteDetail={() => null} /><div className="mt-3 grid grid-cols-3 gap-2"><SummaryMini label="Tasks" value={tasks.length} /><SummaryMini label="Supply" value={dieselTransactions.length} /><SummaryMini label="Spot Checks" value={spotChecks.length} /></div><div className="mt-3 space-y-2">{tasks.map((task: SiteAction) => <button key={task.id} className="w-full rounded-xl border border-slate-700/60 p-2 text-left text-xs" onClick={() => openTaskDetail(task.id)}>{task.action_type} • {task.execution_status || task.status}</button>)}</div></GlassCard></Screen>;
+}
+
+function TaskDetailScreen({ task, site, insight, startTask, goBack }: any) {
+  if (!task) return <Screen title="Task Detail"><EmptyState title="Task not found" text="Return and select a valid task." /></Screen>;
+  return <Screen title="Task Detail"><GlassCard><button className="mb-3 text-xs text-blue-400" onClick={goBack}>Back</button><TaskCard task={task} currentUser={{ role: "User" }} startTask={startTask} openTaskDetail={() => null} /><p className="mt-3 text-xs text-slate-400">{site?.site_id} • Runout {insight?.runout_days || "-"} days</p></GlassCard></Screen>;
+}
+
+function ClusterDetailScreen({ cluster, sites, insights, dieselTransactions, openSiteDetail, goBack }: any) {
+  return <Screen title={cluster || "Cluster"}><GlassCard><button className="mb-3 text-xs text-blue-400" onClick={goBack}>Back</button><div className="mb-3 grid grid-cols-3 gap-2"><SummaryMini label="Sites" value={sites.length} /><SummaryMini label="Critical" value={insights.filter((row: SiteDieselInsight) => Number(row.runout_days) <= 3).length} /><SummaryMini label="Supply" value={dieselTransactions.filter((tx: DieselTx) => sites.some((site: Site) => site.site_id === tx.site_id)).length} /></div><div className="space-y-2">{sites.map((site: Site) => <SummarySiteItem key={site.site_id} site={site} insight={insights.find((row: SiteDieselInsight) => row.site_id === site.site_id)} openSiteDetail={openSiteDetail} />)}</div></GlassCard></Screen>;
 }
 
 function BottomNav({ page, setPage }: { page: Page; setPage: (page: Page) => void }) {
