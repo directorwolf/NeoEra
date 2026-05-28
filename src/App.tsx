@@ -1005,6 +1005,12 @@ export default function App() {
       }
 
       if (!authPhone) return;
+      const phoneProfile = await findProfileForPhone(authPhone);
+      if (phoneProfile) {
+        setCurrentUser(mapUser(phoneProfile));
+        return;
+      }
+
       const matchedSites = await findSitesForPhone(authPhone);
       if (!matchedSites.length) {
         await supabase.auth.signOut();
@@ -1036,13 +1042,27 @@ export default function App() {
     return data || [];
   }
 
+  async function findProfileForPhone(phone: string) {
+    const { data, error } = await supabase
+      .from("users")
+      .select("*")
+      .eq("phone_normalized", phone)
+      .eq("is_active", true)
+      .maybeSingle();
+    if (error) throw error;
+    return data || null;
+  }
+
   async function handleSendOtp() {
     await runAction(async () => {
       const phone = normalizePhone(phoneInput);
       if (!phone || phone.length < 14) throw new Error("Enter phone as 8133394660 or 08133394660.");
-      const matchedSites = await findSitesForPhone(phone);
-      if (!matchedSites.length) throw new Error("This number is not assigned to a NeoEra user. Contact Admin.");
-      const { error } = await supabase.auth.signInWithOtp({ phone });
+      const [matchedSites, phoneProfile] = await Promise.all([findSitesForPhone(phone), findProfileForPhone(phone)]);
+      if (!matchedSites.length && !phoneProfile) throw new Error("This number is not assigned to a NeoEra user. Contact Admin.");
+      const { error } = await supabase.auth.signInWithOtp({
+        phone,
+        options: { channel: "whatsapp" },
+      });
       if (error) throw error;
       setOtpSent(true);
       setLoginMessage("OTP sent. Check WhatsApp/SMS and enter the code.");
@@ -1054,6 +1074,12 @@ export default function App() {
       const phone = normalizePhone(phoneInput);
       const { error } = await supabase.auth.verifyOtp({ phone, token: otpInput.trim(), type: "sms" });
       if (error) throw error;
+      const phoneProfile = await findProfileForPhone(phone);
+      if (phoneProfile) {
+        setCurrentUser(mapUser(phoneProfile));
+        setLoginMessage("");
+        return;
+      }
       const matchedSites = await findSitesForPhone(phone);
       if (!matchedSites.length) throw new Error("This number is not assigned to a NeoEra user. Contact Admin.");
       const firstSite = matchedSites[0] as Site;
@@ -1176,6 +1202,31 @@ export default function App() {
     }).eq("id", truck.id);
 
     await logActivity("Truck Dispatch", `${truck.truck_number} dispatched to ${plan.site_id} for ${qty}L.`, "truck_dispatches", plan.site_id);
+    await loadLogisticsData();
+  }
+
+
+  async function createDieselTruck(payload: Partial<DieselTruck>) {
+    if (!currentUser) throw new Error("No active user.");
+    if (!["Admin", "RTO", "Logistics Coordinator"].includes(currentUser.role)) throw new Error("Logistics access only.");
+    if (!payload.truck_number) throw new Error("Truck number is required.");
+
+    const { data, error } = await supabase.from("diesel_trucks").insert({
+      truck_number: payload.truck_number,
+      capacity_litres: Number(payload.capacity_litres || 14000),
+      current_volume_litres: Number(payload.current_volume_litres || 0),
+      driver_name: payload.driver_name || null,
+      driver_phone: payload.driver_phone || null,
+      transporter: payload.transporter || null,
+      status: payload.status || "Available",
+      cycle_start_date: payload.cycle_start_date || new Date().toISOString().slice(0, 10),
+      current_cluster: payload.current_cluster || null,
+      created_by_phone: currentUser.phone || null,
+      created_by_email: currentUser.email || null,
+    }).select("*").single();
+
+    if (error) throw error;
+    await logActivity("Create Truck", `${currentUser.name || "Logistics Coordinator"} created truck ${payload.truck_number} with ${Number(payload.current_volume_litres || 0)}L available.`, "diesel_trucks", data?.id);
     await loadLogisticsData();
   }
 
@@ -1543,6 +1594,34 @@ export default function App() {
     );
   }
 
+  if (currentUser.role === "Logistics Coordinator") {
+    return (
+      <div className="min-h-screen overflow-x-hidden bg-[#06111f] text-white">
+        <div className="mx-auto min-h-screen w-full max-w-[460px] pb-10 md:max-w-3xl lg:max-w-6xl xl:max-w-7xl">
+          <AppHeader user={currentUser} openTasks={0} />
+          <main className="space-y-4 px-4 md:px-6">
+            <LogisticsCoordinatorScreen
+              currentUser={currentUser}
+              trucks={dieselTrucks}
+              dispatches={truckDispatches}
+              plans={deliveryPlans}
+              sites={sites}
+              insights={siteDieselInsights}
+              runAction={runAction}
+              createTruckDispatch={createTruckDispatch}
+              createDieselTruck={createDieselTruck}
+              refresh={async () => { await loadLogisticsData(); await loadDeliveryPlans(); await loadOperationalData(); }}
+              logout={handleLogout}
+              goBack={() => undefined}
+              logisticsOnly
+            />
+            <UiFeedback uiState={uiState} />
+          </main>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen overflow-x-hidden bg-[#06111f] text-white">
       <div className="mx-auto min-h-screen w-full max-w-[460px] pb-24 md:max-w-3xl lg:max-w-6xl xl:max-w-7xl">
@@ -1552,7 +1631,7 @@ export default function App() {
           {page === "home" && <HomeScreen user={currentUser} sites={visibleSites} nearRunout={nearRunout} pendingApprovals={pendingApprovals} dieselInHand={dieselInHand} totalConsumption={totalConsumption} totalSupply={totalSupply} recentActivities={activities} goTo={navigate} openSummary={openSummary} tasks={visibleTasks} suppliedThisMonth={new Set(visibleDieselTransactions.filter((tx) => new Date(tx.transaction_date || tx.created_at || 0) >= getCycleStartDate()).map((tx) => tx.site_id)).size} neoRating={myNeoEraRating} notifications={operationalNotifications} openNotificationAction={openNotificationAction} />}
           {page === "operations" && <OperationsScreen groupedTasks={groupedTasks} currentUser={currentUser} startTask={startTask} openTaskDetail={openTaskDetail} setPage={navigate} />}
           {page === "diesel_planning" && <DieselPlanningScreen sites={visibleSites} insights={siteDieselInsights} deliveryPlans={deliveryPlans} runAction={runAction} createDeliveryPlan={createDeliveryPlan} openSiteDetail={openSiteDetail} goBack={() => navigate("operations")} />}
-          {page === "logistics" && <LogisticsCoordinatorScreen currentUser={currentUser} trucks={dieselTrucks} dispatches={truckDispatches} plans={deliveryPlans} sites={visibleSites} runAction={runAction} createTruckDispatch={createTruckDispatch} refresh={loadLogisticsData} goBack={() => navigate("operations")} />}
+          {page === "logistics" && ["Admin", "RTO", "Logistics Coordinator"].includes(currentUser.role) && <LogisticsCoordinatorScreen currentUser={currentUser} trucks={dieselTrucks} dispatches={truckDispatches} plans={deliveryPlans} sites={visibleSites} insights={siteDieselInsights} runAction={runAction} createTruckDispatch={createTruckDispatch} createDieselTruck={createDieselTruck} refresh={loadLogisticsData} goBack={() => navigate("operations")} logout={handleLogout} />}
           {page === "intelligence" && <IntelligenceScreen insights={siteDieselInsights} riskRows={riskRows} capexRatings={capexRatings} cycleStart={cycleStart} cycleEnd={cycleEnd} setCycleStart={setCycleStart} setCycleEnd={setCycleEnd} exportDashboardData={exportDashboardData} openSiteDetail={openSiteDetail} openClusterDetail={openClusterDetail} currentUser={currentUser} sites={visibleSites} />}
           {page === "approvals" && <ApprovalsScreen approvals={pendingApprovals} currentUser={currentUser} insights={siteDieselInsights} dieselTransactions={visibleDieselTransactions} openTaskDetail={openTaskDetail} approveTask={(task, comment) => runAction(() => approveTask(task, comment), "Task approved")} disputeTask={(task, comment) => runAction(() => disputeTask(task, comment), "Task disputed")} />}
           {page === "summary" && <SummaryScreen kind={summaryKind} sites={visibleSites} insights={siteDieselInsights} tasks={visibleTasks} approvals={pendingApprovals} dieselTransactions={visibleDieselTransactions} deliveryPlans={deliveryPlans} runAction={runAction} createDeliveryPlan={createDeliveryPlan} goTo={navigate} openSiteDetail={openSiteDetail} openTaskDetail={openTaskDetail} openClusterDetail={openClusterDetail} currentUser={currentUser} />}
@@ -2881,8 +2960,8 @@ function Select({ value, onChange, options }: any) {
   return <select className="w-full rounded-2xl border border-slate-700 bg-slate-950/60 px-4 py-3 text-white" value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option: string) => <option key={option || "empty"} value={option}>{option || "Select"}</option>)}</select>;
 }
 
-function DarkInput({ value, onChange, type = "text" }: any) {
-  return <input className="w-full rounded-2xl border border-slate-700 bg-slate-950/60 px-4 py-3 text-white" type={type} value={value} onChange={(event) => onChange(event.target.value)} />;
+function DarkInput({ value, onChange, type = "text", placeholder = "" }: any) {
+  return <input className="w-full rounded-2xl border border-slate-700 bg-slate-950/60 px-4 py-3 text-white outline-none placeholder:text-slate-500" placeholder={placeholder} type={type} value={value} onChange={(event) => onChange(event.target.value)} />;
 }
 
 
@@ -2934,9 +3013,17 @@ function RotatingSafetyFact({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function LogisticsCoordinatorScreen({ currentUser, trucks, dispatches, plans, sites, runAction, createTruckDispatch, refresh, goBack }: any) {
+function LogisticsCoordinatorScreen({ currentUser, trucks, dispatches, plans, sites, insights = [], runAction, createTruckDispatch, createDieselTruck, refresh, goBack, logout, logisticsOnly }: any) {
   const [selectedTruckId, setSelectedTruckId] = useState("");
   const [query, setQuery] = useState("");
+  const [truckNumber, setTruckNumber] = useState("");
+  const [truckCapacity, setTruckCapacity] = useState("14000");
+  const [truckVolume, setTruckVolume] = useState("");
+  const [driverName, setDriverName] = useState("");
+  const [driverPhone, setDriverPhone] = useState("");
+  const [transporter, setTransporter] = useState("");
+  const [assignedCluster, setAssignedCluster] = useState("");
+
   const activePlans = (plans || []).filter((plan: DeliveryPlan) => ["Planned", "Approved", "In Progress"].includes(plan.planning_status || "Planned"));
   const filteredPlans = activePlans.filter((plan: DeliveryPlan) => `${plan.site_id} ${plan.route_group || ""} ${plan.route_name || ""}`.toLowerCase().includes(query.toLowerCase()));
   const selectedTruck = (trucks || []).find((truck: DieselTruck) => truck.id === selectedTruckId) || (trucks || [])[0];
@@ -2944,22 +3031,78 @@ function LogisticsCoordinatorScreen({ currentUser, trucks, dispatches, plans, si
   const plannedLitres = activePlans.reduce((sum: number, plan: DeliveryPlan) => sum + Number(plan.planned_qty_litres || 0), 0);
   const activeDispatches = (dispatches || []).filter((row: TruckDispatch) => !["Delivered", "Failed"].includes(row.dispatch_status || ""));
 
+  const truckableSites = (sites || []).filter((site: Site) => site.is_truckable === true);
+  const nonTruckableSites = (sites || []).filter((site: Site) => site.is_truckable !== true);
+  const allocationTotal = (sites || []).reduce((sum: number, site: Site) => sum + Number(site.monthly_allocation_litres || 0), 0);
+  const truckableAllocation = truckableSites.reduce((sum: number, site: Site) => sum + Number(site.monthly_allocation_litres || 0), 0);
+  const nonTruckableAllocation = nonTruckableSites.reduce((sum: number, site: Site) => sum + Number(site.monthly_allocation_litres || 0), 0);
+  const allocationVariance = allocationTotal - plannedLitres;
+
+  async function submitTruck() {
+    await createDieselTruck({
+      truck_number: truckNumber.trim(),
+      capacity_litres: Number(truckCapacity || 14000),
+      current_volume_litres: Number(truckVolume || 0),
+      driver_name: driverName.trim(),
+      driver_phone: driverPhone.trim(),
+      transporter: transporter.trim(),
+      current_cluster: assignedCluster.trim(),
+      status: "Available",
+      cycle_start_date: new Date().toISOString().slice(0, 10),
+    });
+    setTruckNumber("");
+    setTruckCapacity("14000");
+    setTruckVolume("");
+    setDriverName("");
+    setDriverPhone("");
+    setTransporter("");
+    setAssignedCluster("");
+  }
+
   return (
-    <Screen title="Logistics Coordinator">
+    <Screen title="Logistics Command">
       <GlassCard>
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
-            <h3 className="font-black">Diesel Management Layer</h3>
-            <p className="mt-1 text-xs text-slate-400">Manage truck volume, dispatch plans, allocation cycles and route execution.</p>
-            <p className="mt-1 text-[10px] text-emerald-400">Role: {currentUser?.role}</p>
+            <h3 className="text-xl font-black">Logistics Coordinator Console</h3>
+            <p className="mt-1 text-xs text-slate-400">Create trucks, control available volume, dispatch planned sites and govern allocation variance.</p>
+            <p className="mt-1 text-[10px] text-emerald-400">This role is isolated from Team Lead, Supervisor, EFS and MRTO workflows.</p>
           </div>
-          <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>
+          <div className="flex gap-2">
+            {!logisticsOnly && <button className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-blue-400" onClick={goBack}>Back</button>}
+            {logisticsOnly && <button className="rounded-xl border border-red-400/40 px-3 py-2 text-xs text-red-300" onClick={logout}>Logout</button>}
+          </div>
         </div>
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
           <SummaryMini label="Truck Volume" value={`${Math.round(totalTruckVolume)}L`} />
           <SummaryMini label="Planned Qty" value={`${Math.round(plannedLitres)}L`} />
+          <SummaryMini label="Allocation Variance" value={`${Math.round(allocationVariance)}L`} />
           <SummaryMini label="Active Dispatch" value={activeDispatches.length} />
         </div>
+      </GlassCard>
+
+      <GlassCard>
+        <h3 className="mb-3 font-bold">Create Diesel Truck</h3>
+        <div className="grid gap-3 md:grid-cols-2">
+          <DarkInput value={truckNumber} onChange={setTruckNumber} placeholder="Truck number e.g. TRK-142" />
+          <DarkInput value={truckCapacity} onChange={setTruckCapacity} placeholder="Capacity litres e.g. 14000" />
+          <DarkInput value={truckVolume} onChange={setTruckVolume} placeholder="Available qty on truck" />
+          <DarkInput value={assignedCluster} onChange={setAssignedCluster} placeholder="Assigned cluster / route" />
+          <DarkInput value={driverName} onChange={setDriverName} placeholder="Driver name" />
+          <DarkInput value={driverPhone} onChange={setDriverPhone} placeholder="Driver phone" />
+          <DarkInput value={transporter} onChange={setTransporter} placeholder="Transporter" />
+          <button className="rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-black text-white" onClick={() => runAction(submitTruck, "Truck created")}>Create Truck</button>
+        </div>
+      </GlassCard>
+
+      <GlassCard>
+        <h3 className="mb-3 font-bold">Allocation vs Planning Exposure</h3>
+        <div className="grid grid-cols-3 gap-2">
+          <SummaryMini label="Truckable Allocation" value={`${Math.round(truckableAllocation)}L`} />
+          <SummaryMini label="Non-Truckable Allocation" value={`${Math.round(nonTruckableAllocation)}L`} />
+          <SummaryMini label="Total Sites" value={(sites || []).length} />
+        </div>
+        <p className="mt-3 text-xs text-slate-400">Upload Center remains the source for cycle start date and allocation refresh. This console reads the allocation exposure and turns planned diesel movement into truck dispatch.</p>
       </GlassCard>
 
       <GlassCard>
@@ -2971,7 +3114,7 @@ function LogisticsCoordinatorScreen({ currentUser, trucks, dispatches, plans, si
                 <div>
                   <p className="font-black text-white">{truck.truck_number}</p>
                   <p className="text-xs text-slate-400">{truck.driver_name || "Driver not set"} • {truck.transporter || "Transporter not set"}</p>
-                  <p className="text-[10px] text-slate-500">Cluster: {truck.current_cluster || "-"} • Cycle: {truck.cycle_start_date || "-"}</p>
+                  <p className="text-[10px] text-slate-500">Route: {truck.current_cluster || "-"} • Cycle: {truck.cycle_start_date || "-"}</p>
                 </div>
                 <div className="text-right">
                   <p className="text-sm font-black text-emerald-400">{Number(truck.current_volume_litres || 0).toLocaleString()}L</p>
@@ -2980,7 +3123,7 @@ function LogisticsCoordinatorScreen({ currentUser, trucks, dispatches, plans, si
                 </div>
               </div>
             </button>
-          )) : <EmptyState title="No trucks loaded" text="Upload or create diesel trucks in Supabase table diesel_trucks. Columns: truck_number, capacity_litres, current_volume_litres, driver_name, driver_phone, transporter, status, cycle_start_date, current_cluster." />}
+          )) : <EmptyState title="No trucks created" text="Create trucks here. Logistics Coordinator controls available volume before dispatch." />}
         </div>
       </GlassCard>
 
@@ -3034,7 +3177,7 @@ function ProfileScreen({ user, sites, canCreateTasks, setPage, logout }: any) {
         {canCreateTasks && <QuickAction icon={<Plus className="h-5 w-5" />} label="Create Task" onClick={() => setPage("create_task")} />}
         <QuickAction icon={<Database className="h-5 w-5" />} label="Upload Center" onClick={() => setPage("upload_center")} />
         <QuickAction icon={<Activity className="h-5 w-5" />} label="Recent Activity" onClick={() => setPage("recent_activity")} />
-        <QuickAction icon={<Database className="h-5 w-5" />} label="Logistics Coordinator" onClick={() => setPage("logistics")} />
+        {["Admin", "RTO", "Logistics Coordinator"].includes(user.role) && <QuickAction icon={<Database className="h-5 w-5" />} label="Logistics Coordinator" onClick={() => setPage("logistics")} />}
       </div>
       <button className="w-full rounded-2xl border border-red-400/40 px-4 py-3 text-sm font-bold text-red-300" onClick={logout}>Log out</button>
     </Screen>
@@ -3050,8 +3193,8 @@ function UploadCenterScreen({ currentUser, runAction, refresh, goBack }: any) {
         <div className="mt-4 grid gap-2">
           <InfoUploadLane title="Spot Check Upload" text="Updates diesel level, CPD, runout date and field intelligence." />
           <InfoUploadLane title="Supply Upload" text="Posts supply quantities and supply timeline. Admin uploads bypass MRTO approval." />
-          <InfoUploadLane title="Allocation Upload" text="Logistics Coordinator updates allocation, cycle start date and planned balances." />
-          <InfoUploadLane title="Truck Registry Upload" text="Creates trucks, starting volume, status, driver and transporter records." />
+          {["Admin", "RTO", "Logistics Coordinator"].includes(currentUser?.role) && <InfoUploadLane title="Allocation Upload" text="Logistics Coordinator updates allocation, cycle start date and planned balances." />}
+          {["Admin", "RTO", "Logistics Coordinator"].includes(currentUser?.role) && <InfoUploadLane title="Truck Registry Upload" text="Creates trucks, starting volume, status, driver and transporter records." />}
         </div>
         <button className="mt-4 rounded-xl bg-blue-500 px-4 py-2 text-xs font-bold" onClick={() => runAction(refresh, "Data refreshed")}>Refresh Data</button>
         <button className="ml-2 mt-4 rounded-xl border border-slate-700 px-4 py-2 text-xs font-bold text-slate-300" onClick={goBack}>Back</button>
