@@ -1060,12 +1060,11 @@ export default function App() {
       const [matchedSites, phoneProfile] = await Promise.all([findSitesForPhone(phone), findProfileForPhone(phone)]);
       if (!matchedSites.length && !phoneProfile) throw new Error("This number is not assigned to a NeoEra user. Contact Admin.");
       const { error } = await supabase.auth.signInWithOtp({
-        phone,
-        options: { channel: "whatsapp" },
+        await supabase.auth.signInWithOtp({ phone });
       });
       if (error) throw error;
       setOtpSent(true);
-      setLoginMessage("OTP sent. Check WhatsApp/SMS and enter the code.");
+      setLoginMessage("OTP sent. Check SMS and enter the code.");
     }, "OTP sent");
   }
 
