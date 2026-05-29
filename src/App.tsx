@@ -885,6 +885,37 @@ function PageFallback({ page, setPage }: { page: Page; setPage: (page: Page) => 
   );
 }
 
+class PageErrorBoundary extends React.Component<{ children: React.ReactNode; page: Page; setPage: (page: Page) => void }, { hasError: boolean; message: string }> {
+  constructor(props: { children: React.ReactNode; page: Page; setPage: (page: Page) => void }) {
+    super(props);
+    this.state = { hasError: false, message: "" };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, message: error?.message || "Page render failed" };
+  }
+
+  componentDidUpdate(prevProps: { page: Page }) {
+    if (prevProps.page !== this.props.page && this.state.hasError) {
+      this.setState({ hasError: false, message: "" });
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="lg:col-span-12 rounded-2xl border border-red-400/40 bg-red-500/10 p-4 text-white">
+          <p className="font-bold text-red-300">This page needs cleanup before demo.</p>
+          <p className="mt-2 text-sm text-slate-300">Page: {this.props.page}</p>
+          <p className="mt-1 text-xs text-slate-500">{this.state.message}</p>
+          <button className="mt-4 rounded-xl bg-blue-500 px-4 py-2 font-bold" onClick={() => this.props.setPage("home")}>Return Home</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("home");
   const [summaryKind, setSummaryKind] = useState<SummaryKind>("sites");
@@ -1059,12 +1090,10 @@ export default function App() {
       if (!phone || phone.length < 14) throw new Error("Enter phone as 8133394660 or 08133394660.");
       const [matchedSites, phoneProfile] = await Promise.all([findSitesForPhone(phone), findProfileForPhone(phone)]);
       if (!matchedSites.length && !phoneProfile) throw new Error("This number is not assigned to a NeoEra user. Contact Admin.");
-      const { error } = await supabase.auth.signInWithOtp({
-        await supabase.auth.signInWithOtp({ phone });
-      });
+      const { error } = await supabase.auth.signInWithOtp({ phone });
       if (error) throw error;
       setOtpSent(true);
-      setLoginMessage("OTP sent. Check SMS and enter the code.");
+      setLoginMessage("OTP sent by SMS. Enter the code when received.");
     }, "OTP sent");
   }
 
@@ -1555,8 +1584,18 @@ export default function App() {
 
   if (!currentUser) {
     return (
-      <div className="min-h-screen overflow-x-hidden bg-[#06111f] p-4 text-white">
-        <div className="mx-auto flex min-h-screen max-w-md items-center">
+      <div className="min-h-screen overflow-x-hidden bg-[#06111f] p-4 text-white" style={{ backgroundImage: "linear-gradient(125deg,rgba(6,17,31,.90),rgba(6,17,31,.50),rgba(6,17,31,.98)), url(/landing/ops-hero.jpg)", backgroundSize: "cover", backgroundPosition: "center" }}>
+        <div className="mx-auto grid min-h-screen max-w-6xl items-center gap-6 lg:grid-cols-[1.15fr_.85fr]">
+          <div className="hidden lg:block rounded-[34px] border border-cyan-400/20 bg-black/25 p-7 backdrop-blur-sm">
+            <div className="mb-5 inline-flex rounded-full border border-cyan-400/30 bg-cyan-500/10 px-4 py-2 text-[10px] font-black uppercase tracking-[0.22em] text-cyan-300">Live Field Intelligence</div>
+            <h1 className="max-w-xl text-5xl font-black tracking-tight text-white">Operational Decision Intelligence</h1>
+            <p className="mt-4 max-w-lg text-sm leading-6 text-slate-300">NeoEra converts site, diesel, truck, task, and field telemetry into decisive operational actions.</p>
+            <div className="mt-7 grid grid-cols-3 gap-3">
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-3"><p className="text-2xl font-black text-cyan-300">72h</p><p className="text-[10px] uppercase tracking-widest text-slate-400">Runout Forecast</p></div>
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-3"><p className="text-2xl font-black text-emerald-300">14K</p><p className="text-[10px] uppercase tracking-widest text-slate-400">Truck Logic</p></div>
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-3"><p className="text-2xl font-black text-orange-300">HSE</p><p className="text-[10px] uppercase tracking-widest text-slate-400">Safety Pulse</p></div>
+            </div>
+          </div>
           <div className="w-full rounded-[32px] border border-slate-700/70 bg-[#081827]/90 p-7 shadow-2xl shadow-black/60">
             <div className="mb-6 flex items-center gap-3">
               <img src="/neoera-icon.png" className="h-11 w-11 rounded-xl object-contain" alt="NeoEra" />
@@ -1627,6 +1666,7 @@ export default function App() {
         <AppHeader user={currentUser} openTasks={openTasks.length} />
         <main className="space-y-4 px-4 md:px-6 lg:grid lg:grid-cols-12 lg:gap-5 lg:space-y-0">
           {completionState && <CompletionSheet state={completionState} closeCompletion={closeCompletion} openSiteDetail={() => selectedSite ? openSiteDetail(selectedSite) : selectedDetailSiteId ? openSiteDetail(selectedDetailSiteId) : null} />}
+          <PageErrorBoundary page={page} setPage={setPage}>
           {page === "home" && <HomeScreen user={currentUser} sites={visibleSites} nearRunout={nearRunout} pendingApprovals={pendingApprovals} dieselInHand={dieselInHand} totalConsumption={totalConsumption} totalSupply={totalSupply} recentActivities={activities} goTo={navigate} openSummary={openSummary} tasks={visibleTasks} suppliedThisMonth={new Set(visibleDieselTransactions.filter((tx) => new Date(tx.transaction_date || tx.created_at || 0) >= getCycleStartDate()).map((tx) => tx.site_id)).size} neoRating={myNeoEraRating} notifications={operationalNotifications} openNotificationAction={openNotificationAction} />}
           {page === "operations" && <OperationsScreen groupedTasks={groupedTasks} currentUser={currentUser} startTask={startTask} openTaskDetail={openTaskDetail} setPage={navigate} />}
           {page === "diesel_planning" && <DieselPlanningScreen sites={visibleSites} insights={siteDieselInsights} deliveryPlans={deliveryPlans} runAction={runAction} createDeliveryPlan={createDeliveryPlan} openSiteDetail={openSiteDetail} goBack={() => navigate("operations")} />}
@@ -1644,6 +1684,7 @@ export default function App() {
           {page === "upload_center" && <UploadCenterScreen currentUser={currentUser} runAction={runAction} refresh={loadOperationalData} goBack={() => navigate("operations")} />}
         {page === "create_task" && <CreateTaskScreen sites={visibleSites} users={smartAssignableUsers(createTaskSite)} taskType={createTaskType} setTaskType={setCreateTaskType} selectedSite={createTaskSite} setSelectedSite={(siteId) => { setCreateTaskSite(siteId); setCreateTaskAssignee(""); }} selectedAssignee={createTaskAssignee} setSelectedAssignee={setCreateTaskAssignee} createTask={() => runAction(createAssignedTask, "Task created")} />}
           {page === "action_task" && activeTask && <ActionTaskScreen task={activeTask} selectedSite={selectedSite} setSelectedSite={setSelectedSite} sites={visibleSites} supplyDate={supplyDate} setSupplyDate={setSupplyDate} initialDip={initialDip} setInitialDip={setInitialDip} qtySupplied={qtySupplied} setQtySupplied={setQtySupplied} spotCheckDate={spotCheckDate} setSpotCheckDate={setSpotCheckDate} dieselLevel={dieselLevel} setDieselLevel={setDieselLevel} dgCapacity={dgCapacity} setDgCapacity={setDgCapacity} closureNote={closureNote} setClosureNote={setClosureNote} unsafeCondition={unsafeCondition} setUnsafeCondition={setUnsafeCondition} recommendedAction={recommendedAction} setRecommendedAction={setRecommendedAction} submitSpotCheck={() => runAction(submitSpotCheckTask, "Spot check submitted")} submitSupply={() => runAction(submitSupplyTask, "Supply submitted")} />}
+          </PageErrorBoundary>
         </main>{![
   "home",
   "operations",
@@ -2183,18 +2224,22 @@ function ActivityRow({ activity }: { activity: RecentActivity }) {
 function OperationsScreen({ groupedTasks, currentUser, startTask, openTaskDetail, setPage }: any) {
   const [tab, setTab] = useState("Supply");
   const rows = tab === "Spot Check" ? groupedTasks.spotChecks : tab === "Supply" ? groupedTasks.supplies : tab === "Approvals" ? groupedTasks.approvals : groupedTasks.disputes;
+  const canUseUploadCenter = ["Admin", "RTO", "Logistics Coordinator"].includes(currentUser?.role);
+  const canSeeLogistics = ["Admin", "RTO", "Logistics Coordinator"].includes(currentUser?.role);
   return (
     <Screen title="Operations">
       <div className="grid gap-3 md:grid-cols-2">
-        <GlassCard>
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <h3 className="font-bold">Upload Center</h3>
-              <p className="text-xs text-slate-400">Post supply and spot-check data with approval routing.</p>
+        {canUseUploadCenter && (
+          <GlassCard>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h3 className="font-bold">Upload Center</h3>
+                <p className="text-xs text-slate-400">Admin and Logistics Coordinator bulk upload area.</p>
+              </div>
+              <button className="rounded-2xl bg-blue-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("upload_center")}>Open</button>
             </div>
-            <button className="rounded-2xl bg-blue-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("upload_center")}>Open</button>
-          </div>
-        </GlassCard>
+          </GlassCard>
+        )}
         <GlassCard>
           <div className="flex items-center justify-between gap-3">
             <div>
@@ -2204,15 +2249,17 @@ function OperationsScreen({ groupedTasks, currentUser, startTask, openTaskDetail
             <button className="rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("diesel_planning")}>Open</button>
           </div>
         </GlassCard>
-        <GlassCard>
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <h3 className="font-bold">Logistics Coordinator</h3>
-              <p className="text-xs text-slate-400">Track trucks, available volume, dispatch status and cycle logistics.</p>
+        {canSeeLogistics && (
+          <GlassCard>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h3 className="font-bold">Logistics Coordinator</h3>
+                <p className="text-xs text-slate-400">Track trucks, available volume, dispatch status and cycle logistics.</p>
+              </div>
+              <button className="rounded-2xl bg-cyan-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("logistics")}>Open</button>
             </div>
-            <button className="rounded-2xl bg-cyan-500 px-4 py-3 text-sm font-bold text-white" onClick={() => setPage("logistics")}>Open</button>
-          </div>
-        </GlassCard>
+          </GlassCard>
+        )}
       </div>
       <Segment tabs={["Spot Check", "Supply", "Approvals", "Disputes"]} active={tab} setActive={setTab} />
       <div className="grid grid-cols-4 gap-2">
